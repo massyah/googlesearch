@@ -31,7 +31,13 @@
 import os
 import random
 import sys
+import tempfile
 import time
+
+from loguru import logger
+
+from data_collectors.googlesearch.googlesearch.parsers import GoogleResult, GoogleSearch
+from toolbox.osx.osx_system import open_with_chrome
 
 if sys.version_info[0] > 2:
     from http.cookiejar import LWPCookieJar
@@ -45,9 +51,11 @@ else:
 
 try:
     from bs4 import BeautifulSoup
+
     is_bs4 = True
 except ImportError:
     from BeautifulSoup import BeautifulSoup
+
     is_bs4 = False
 
 __all__ = [
@@ -90,12 +98,12 @@ home_folder = os.getenv('HOME')
 if not home_folder:
     home_folder = os.getenv('USERHOME')
     if not home_folder:
-        home_folder = '.'   # Use the current folder on error.
+        home_folder = '.'  # Use the current folder on error.
 cookie_jar = LWPCookieJar(os.path.join(home_folder, '.google-cookie'))
 try:
     cookie_jar.load()
 except Exception:
-    pass
+    logger.debug("Couldn't load cookie jar")
 
 # Default user agent, unless instructed by the user to change it.
 USER_AGENT = 'Mozilla/4.0 (compatible; MSIE 8.0; Windows NT 6.0)'
@@ -110,6 +118,7 @@ try:
     try:
         user_agents_file = os.path.join(install_folder, 'user_agents.txt.gz')
         import gzip
+
         fp = gzip.open(user_agents_file, 'rb')
         try:
             user_agents_list = [_.strip() for _ in fp.readlines()]
@@ -121,6 +130,7 @@ try:
         with open(user_agents_file) as fp:
             user_agents_list = [_.strip() for _ in fp.readlines()]
 except Exception:
+    logger.debug("Defaulting to {} USER_AGENT", USER_AGENT)
     user_agents_list = [USER_AGENT]
 
 
@@ -179,8 +189,9 @@ def get_page(url, user_agent=None):
     response.close()
     try:
         cookie_jar.save()
+        logger.info("Saved cookie jar to {}", cookie_jar.filename)
     except Exception:
-        pass
+        logger.info("Error saving cookie jar")
     return html
 
 
@@ -207,9 +218,16 @@ def filter_result(link):
 
 
 # Returns a generator that yields URLs.
+def _save_and_open(response: bytes):
+    code, tmp_file = tempfile.mkstemp(suffix=".html")
+    with open(tmp_file, "w") as fh:
+        fh.write(response.decode("utf-8"))
+    open_with_chrome(tmp_file, foreground=False)
+
+
 def search(query, tld='com', lang='en', tbs='0', safe='off', num=10, start=0,
            stop=None, domains=None, pause=2.0, tpe='', country='',
-           extra_params=None, user_agent=None):
+           extra_params=None, user_agent=None, debug=False) -> GoogleSearch:
     """
     Search the given query string using Google.
 
@@ -255,7 +273,7 @@ def search(query, tld='com', lang='en', tbs='0', safe='off', num=10, start=0,
     # Prepare domain list if it exists.
     if domains:
         query = query + ' ' + ' OR '.join(
-                                'site:' + domain for domain in domains)
+            'site:' + domain for domain in domains)
 
     # Prepare the search string.
     query = quote_plus(query)
@@ -310,51 +328,56 @@ def search(query, tld='com', lang='en', tbs='0', safe='off', num=10, start=0,
 
         # Request the Google Search results page.
         html = get_page(url, user_agent)
-
-        # Parse the response and get every anchored URL.
-        if is_bs4:
-            soup = BeautifulSoup(html, 'html.parser')
-        else:
-            soup = BeautifulSoup(html)
-        try:
-            anchors = soup.find(id='search').findAll('a')
-            # Sometimes (depending on the User-agent) there is
-            # no id "search" in html response...
-        except AttributeError:
-            # Remove links of the top bar.
-            gbar = soup.find(id='gbar')
-            if gbar:
-                gbar.clear()
-            anchors = soup.findAll('a')
-
-        # Process every anchored URL.
-        for a in anchors:
-
-            # Get the URL from the anchor tag.
-            try:
-                link = a['href']
-            except KeyError:
-                continue
-
-            # Filter invalid links and links pointing to Google itself.
-            link = filter_result(link)
-            if not link:
-                continue
-
-            # Discard repeated results.
-            h = hash(link)
-            if h in hashes:
-                continue
-            hashes.add(h)
-
-            # Yield the result.
-            yield link
-
-            # Increase the results counter.
-            # If we reached the limit, stop.
-            count += 1
-            if stop and count >= stop:
-                return
+        logger.info("Requested page {}", url)
+        if debug:
+            _save_and_open(html)
+        gs = GoogleSearch.from_html(html)
+        yield gs
+        #
+        # # Parse the response and get every anchored URL.
+        # if is_bs4:
+        #     soup = BeautifulSoup(html, 'html.parser')
+        # else:
+        #     soup = BeautifulSoup(html)
+        # try:
+        #     anchors = soup.find(id='search').findAll('a')
+        #     # Sometimes (depending on the User-agent) there is
+        #     # no id "search" in html response...
+        # except AttributeError:
+        #     # Remove links of the top bar.
+        #     gbar = soup.find(id='gbar')
+        #     if gbar:
+        #         gbar.clear()
+        #     anchors = soup.findAll('a')
+        #
+        # # Process every anchored URL.
+        # for a in anchors:
+        #
+        #     # Get the URL from the anchor tag.
+        #     try:
+        #         link = a['href']
+        #     except KeyError:
+        #         continue
+        #
+        #     # Filter invalid links and links pointing to Google itself.
+        #     link = filter_result(link)
+        #     if not link:
+        #         continue
+        #
+        #     # Discard repeated results.
+        #     h = hash(link)
+        #     if h in hashes:
+        #         continue
+        #     hashes.add(h)
+        #
+        #     # Yield the result.
+        #     yield link
+        #
+        #     # Increase the results counter.
+        #     # If we reached the limit, stop.
+        #     count += 1
+        #     if stop and count >= stop:
+        #         return
 
         # End if there are no more results.
         # XXX TODO review this logic, not sure if this is still true!
